@@ -35,9 +35,8 @@ Utility library for transaction operations
 
 import time
 import logging
+logging.basicConfig()
 import hashlib
-
-from blockchain.util.thrift_conversions import thrift_record_to_dict
 
 try:
     import json
@@ -70,7 +69,6 @@ def sign_transaction(signatory,
     signature_ts = int(time.time())
 
     log.info("Loading private key from string")
-    log.debug("priv:  %s" % private_key_string)
     ecdsa_signing_key = SigningKey.from_pem(private_key_string)
 
     # add transaction header info to hashed_items
@@ -116,19 +114,20 @@ def sign_transaction(signatory,
 
 def sign_verification_record(signatory,
                              prior_block_hash,
-                             lower_phase_hash,
+                             lower_hash,
                              public_key_string,
                              private_key_string,
                              block_id,
                              phase,
                              origin_id,
                              verification_ts,
+                             public_transmission,
                              verification_info):
     """
     sign verification record (common and special info among each phase)
     * signatory (current node's name/id)
     * prior_block_hash
-    * lower_phase_hash
+    * lower_hash
     * public_key
     * private_key
     * block_id
@@ -150,9 +149,9 @@ def sign_verification_record(signatory,
     signature_ts = int(time.time())
     hashed_items = []
 
-    # append prior_block_hash and lower_phase_hash
+    # append prior_block_hash and lower_hash
     hashed_items.append(prior_block_hash)
-    hashed_items.append(lower_phase_hash)
+    hashed_items.append(lower_hash)
 
     # append my signing info for hashing
     hashed_items.append(signatory)
@@ -179,7 +178,8 @@ def sign_verification_record(signatory,
         "origin_id": origin_id,
         "phase": int(phase),
         "prior_hash": prior_block_hash,
-        "lower_phase_hash": lower_phase_hash,
+        "lower_hash": lower_hash,
+        "public_transmission": public_transmission,
         "verification_info": verification_info  # special phase info
     }
 
@@ -192,7 +192,7 @@ def sign_verification_record(signatory,
     return block_info
 
 
-def valid_transaction_sig(transaction, log=logging.getLogger(__name__)):
+def valid_transaction_sig(transaction, test_mode=False, log=logging.getLogger(__name__)):
     """ returns true on valid transaction signature, false otherwise """
     hashed_items = []
 
@@ -243,9 +243,12 @@ def valid_transaction_sig(transaction, log=logging.getLogger(__name__)):
                     signature_block = None
 
         except BadSignatureError:
+            if not test_mode:
+                log.error("BadSignatureError detected.")
             return False
         except:
-            log.warning("An unexpected error has occurred")
+            if not test_mode:
+                log.warning("An unexpected error has occurred. Possible causes: KeyError")
             raise  # re-raise the exception
 
     return True
@@ -253,6 +256,7 @@ def valid_transaction_sig(transaction, log=logging.getLogger(__name__)):
 
 def validate_signature(signature_block, log=logging.getLogger(__name__)):
     """ validate signature using provided stripped and full hashes """
+
     verifying_key = VerifyingKey.from_pem(signature_block["public_key"])
 
     log.info("Decoding the digest")
@@ -265,9 +269,11 @@ def validate_signature(signature_block, log=logging.getLogger(__name__)):
         verifying_key.verify(decoded_digest, str(merged_hash))
     else:
         verifying_key.verify(decoded_digest, str(signature_block["hash"]))
+    # signature hash is valid
+    return True
 
 
-def validate_verification_record(record, verification_info, log=logging.getLogger(__name__)):
+def validate_verification_record(record, verification_info, test_mode=False, log=logging.getLogger(__name__)):
     """
     validate verification record signature
     * verification_record - general info per phase - signing name, timestamp, pub_key, block_id, etc.
@@ -280,7 +286,7 @@ def validate_verification_record(record, verification_info, log=logging.getLogge
         validate_signature(signature_block)
 
         hashed_items.append(record['prior_hash'])
-        hashed_items.append(record['lower_phase_hash'])
+        hashed_items.append(record['lower_hash'])
 
         hashed_items.append(signature_block['signatory'])
         hashed_items.append(signature_block['signature_ts'])
@@ -300,9 +306,12 @@ def validate_verification_record(record, verification_info, log=logging.getLogge
             return False
 
     except BadSignatureError:
+        if not test_mode:
+            log.error("BadSignatureError detected.")
         return False
     except:
-        log.warning("An unexpected error has occurred")
+        if not test_mode:
+            log.warning("An unexpected error has occurred. Possible causes: KeyError")
         raise  # re-raise the exception
 
     return True
