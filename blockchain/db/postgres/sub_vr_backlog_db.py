@@ -32,46 +32,31 @@ __email__ = "joe@dragonchain.org"
 import psycopg2
 import psycopg2.extras
 import uuid
-
-from blockchain.qry import format_block_verification as format_verification_record
-
 from postgres import get_connection_pool
+
+from blockchain.qry import format_backlog
 
 """ CONSTANTS """
 DEFAULT_PAGE_SIZE = 1000
-GET_UNSENT_VERIFIED_RECORDS = """SELECT * FROM vr_transfers WHERE transfer_to = %s AND sent = FALSE"""
-SQL_MARK_RECORD = """UPDATE vr_transfers SET sent = TRUE WHERE transfer_to = %s AND verification_id = %s"""
-SQL_INSERT_QUERY = """INSERT INTO vr_transfers (
-                                  origin_id,
-                                  transfer_to,
-                                  verification_id
-                                ) VALUES (%s, %s, %s)"""
+SQL_GET_BY_ID = """SELECT * FROM sub_vr_backlog WHERE block_id = %s"""
+GET_BACKLOGS = """SELECT * FROM sub_vr_backlog"""
+SQL_INSERT_QUERY = """INSERT INTO sub_vr_backlog (
+                                  transfer_id,
+                                  client_id,
+                                  block_id
+                                  ) VALUES (%s, %s, %s)"""
 
 
-def get_unsent_verification_records(node_transmit_id):
-    """ retrieve validated records that have not already been sent back to node with node_transmit_id or verification_id """
-
-    conn = get_connection_pool().getconn()
-    try:
-        cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(GET_UNSENT_VERIFIED_RECORDS, (node_transmit_id, ))
-        'An iterator that uses fetchmany to keep memory usage down'
-        while True:
-            results = cur.fetchmany(DEFAULT_PAGE_SIZE)
-            if not results:
-                break
-            for result in results:
-                yield format_verification_record(result)
-        cur.close()
-    finally:
-        get_connection_pool().putconn(conn)
-
-
-def insert_transfer(origin_id, transfer_to, verification_id):
+def insert_backlog(client_id, block_id):
+    """
+    insert new backlog
+     param client_id: id of subscribing node
+     param block_id: block id of backlog
+    """
     values = (
-        origin_id,
-        transfer_to,
-        verification_id
+        str(uuid.uuid4()),  # transfer_id PK
+        client_id,
+        block_id
     )
     conn = get_connection_pool().getconn()
     try:
@@ -83,15 +68,22 @@ def insert_transfer(origin_id, transfer_to, verification_id):
         get_connection_pool().putconn(conn)
 
 
-def set_verification_sent(transfer_to, ver_id):
-    """ set verifications sent field to true with matching given 'transfer_to' and 'verification_id' """
-
+def get_backlogs(block_id):
+    """ check if backlog exists for given block id """
+    back_logs = []
     conn = get_connection_pool().getconn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(SQL_MARK_RECORD, (transfer_to, ver_id))
-        conn.commit()
+        cur.execute(SQL_GET_BY_ID, (block_id,))
+        'An iterator that uses fetchmany to keep memory usage down'
+        while True:
+            results = cur.fetchmany(DEFAULT_PAGE_SIZE)
+            if not results:
+                break
+            for result in results:
+                back_logs.append(format_backlog(result))
         cur.close()
+        return back_logs
     finally:
         get_connection_pool().putconn(conn)
 

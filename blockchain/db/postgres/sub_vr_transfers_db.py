@@ -33,45 +33,31 @@ import psycopg2
 import psycopg2.extras
 import uuid
 
-from blockchain.qry import format_block_verification as format_verification_record
+from blockchain.qry import format_sub_response
 
 from postgres import get_connection_pool
 
 """ CONSTANTS """
 DEFAULT_PAGE_SIZE = 1000
-GET_UNSENT_VERIFIED_RECORDS = """SELECT * FROM vr_transfers WHERE transfer_to = %s AND sent = FALSE"""
-SQL_MARK_RECORD = """UPDATE vr_transfers SET sent = TRUE WHERE transfer_to = %s AND verification_id = %s"""
-SQL_INSERT_QUERY = """INSERT INTO vr_transfers (
-                                  origin_id,
+SQL_GET_ALL = """SELECT * FROM sub_vr_transfers WHERE transfer_to = %s"""
+SQL_INSERT_QUERY = """INSERT INTO sub_vr_transfers (
                                   transfer_to,
-                                  verification_id
-                                ) VALUES (%s, %s, %s)"""
+                                  transactions,
+                                  verifications
+                                ) VALUES (%s, %s::json[], %s::json[])"""
 
 
-def get_unsent_verification_records(node_transmit_id):
-    """ retrieve validated records that have not already been sent back to node with node_transmit_id or verification_id """
-
-    conn = get_connection_pool().getconn()
-    try:
-        cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(GET_UNSENT_VERIFIED_RECORDS, (node_transmit_id, ))
-        'An iterator that uses fetchmany to keep memory usage down'
-        while True:
-            results = cur.fetchmany(DEFAULT_PAGE_SIZE)
-            if not results:
-                break
-            for result in results:
-                yield format_verification_record(result)
-        cur.close()
-    finally:
-        get_connection_pool().putconn(conn)
-
-
-def insert_transfer(origin_id, transfer_to, verification_id):
+def insert_transfer(transfer_to, transactions, verifications):
+    """
+    inserts new transfer record containing list of transactions and verifications
+    param transfer_to: node_id to send transfer records to
+    param transactions: list of json formatted transactions
+    param verifications: list of json formatted verification records
+    """
     values = (
-        origin_id,
         transfer_to,
-        verification_id
+        map(psycopg2.extras.Json, transactions),
+        map(psycopg2.extras.Json, verifications)
     )
     conn = get_connection_pool().getconn()
     try:
@@ -83,14 +69,19 @@ def insert_transfer(origin_id, transfer_to, verification_id):
         get_connection_pool().putconn(conn)
 
 
-def set_verification_sent(transfer_to, ver_id):
-    """ set verifications sent field to true with matching given 'transfer_to' and 'verification_id' """
-
+def get_all(transfer_to):
+    """ query for all transfer records with transfer_to matching given transfer_to id """
     conn = get_connection_pool().getconn()
     try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(SQL_MARK_RECORD, (transfer_to, ver_id))
-        conn.commit()
+        cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(SQL_GET_ALL, (transfer_to, ))
+        'An iterator that uses fetchmany to keep memory usage down'
+        while True:
+            results = cur.fetchmany(DEFAULT_PAGE_SIZE)
+            if not results:
+                break
+            for result in results:
+                yield format_sub_response(result)
         cur.close()
     finally:
         get_connection_pool().putconn(conn)

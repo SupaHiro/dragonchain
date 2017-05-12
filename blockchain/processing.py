@@ -37,17 +37,26 @@ from blockchain.block import Block, \
     get_block_time, \
     get_current_block_id
 
-from blockchain.util.crypto import valid_transaction_sig, sign_verification_record, validate_verification_record, final_hash
+from blockchain.util.crypto import valid_transaction_sig, sign_verification_record, validate_verification_record, sign_subscription, final_hash
 
-from db.postgres import transaction_db
-from db.postgres import verification_db
-from db.postgres import vr_transfers_db
-from db.postgres import postgres
+from bitcoin.core import *
+
+from blockchain.db.postgres import postgres
+from blockchain.db.postgres import transaction_db
+from blockchain.db.postgres import verification_db
+from blockchain.db.postgres import vr_transfers_db
+from blockchain.db.postgres import sub_to_db as sub_db
+from blockchain.db.postgres import timestamp_db
 
 import network
 
+from blockchain.smart_contracts import smart_contracts
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+from blockchain.timestamping import BitcoinTimestamper, BitcoinFeeProvider
+from blockchain.util.crypto import final_hash
 
 import logging
 import argparse
@@ -66,6 +75,9 @@ PHASE = 'phase'
 
 SIGNATURE = 'signature'
 HASH = 'hash'
+
+RESERVED_TXN_TYPES = ["TT_SUB_REQ", "TT_PROVISION_SC"]
+LEVEL5_PREFIX = "Dragonchain:"
 
 
 def logger(name="verifier-service"):
@@ -91,12 +103,14 @@ class ProcessingNode(object):
         self._registrations = {}
         self._configured_phases = []
         self._register_configs()
-
-        # dictionary of public transmission flags. set by network, obtained through yml config file.
+        # public transmission flags
         self.public_transmission = None
-
+        # this nodes phases provided
         phase = self.phase_config[0][PHASE]
+        # this nodes network
         self.network = network.ConnectionManager(self.service_config['host'], self.service_config['port'], 0b00001 << phase - 1, self)
+        # smart contract handler used for running reserved and non-reserved smart contracts
+        self.sch = smart_contracts.SmartContractsHandler(self.network, self.service_config['public_key'])
 
     def start(self):
         """ Start the NON-blocking scheduler """
@@ -161,7 +175,20 @@ class ProcessingNode(object):
             self._add_registration(4, self._execute_phase_4, config)
 
         elif config[PHASE] == 5:
+            # Registration for normal phase 5 operations
             self._add_registration(5, self._execute_phase_5, config)
+            # Registering timestamping function
+            self._add_registration("timestamp", self._execute_timestamping, config)
+
+            # Setup phase 5 cron
+            trigger = CronTrigger(second='*/30')
+
+            # setup the scheduler task
+            def trigger_handler():
+                self.notify(event_name="timestamp")
+
+            # schedule task using cron trigger
+            self._scheduler.add_job(trigger_handler, trigger)
 
     def _cron_type_config_handler(self, config):
         """
@@ -202,10 +229,8 @@ class ProcessingNode(object):
         """
         returns prior block hash of curr_block_id.
         returns None if no block_id was found -- meaning this is the first block.
-
-        Args:
-            origin_id:
-            phase
+        :param origin_id: search for hash matching this origin_id
+        :param phase: search for hash matching this phase
         """
         prior_hash = None
         if phase:
@@ -215,6 +240,13 @@ class ProcessingNode(object):
                 prior_hash = prior_block[SIGNATURE][HASH]
 
         return prior_hash
+
+    def get_subscription_signature(self, subscription):
+        """ return signature for given subscription """
+        sign_subscription(self.network.this_node.node_id,
+                          subscription,
+                          self.service_config["private_key"],
+                          self.service_config["public_key"])
 
     def _execute_phase_1(self, config, current_block_id):
         """
@@ -235,21 +267,19 @@ class ProcessingNode(object):
         print ("""Time bounds: %i - %i""" % (block_bound_lower_ts, block_bound_lower_ts + BLOCK_INTERVAL))
         transaction_db.fixate_block(block_bound_lower_ts, block_bound_lower_ts + BLOCK_INTERVAL, current_block_id)
 
-        if 'approve_block' in config:
-            return config['approve_block'](config, current_block_id)
-
         transactions = transaction_db.get_all(block_id=current_block_id)
 
         # Validate the schema and structure of the transactions
         valid_transactions, invalid_transactions = self.split_items(valid_transaction_sig, transactions)
 
-        # Use the custom approval code if configured, otherwise approve all valid transaction
         rejected_transactions = []
-        if 'approve_transaction' in config:
-            approved_transactions, rejected_transactions = \
-                self.split_items(config['approve_transaction'], valid_transactions)
-        else:
-            approved_transactions = valid_transactions
+        approved_transactions = []
+
+        for txn in valid_transactions:
+            if self.handle_transaction(txn):
+                approved_transactions.append(txn)
+            else:
+                rejected_transactions.append(txn)
 
         if len(approved_transactions) > 0:
             # update status of approved transactions
@@ -297,6 +327,18 @@ class ProcessingNode(object):
             for tx in rejected_transactions:
                 tx["header"]["status"] = "rejected"
                 transaction_db.update_transaction(tx)
+
+    def handle_transaction(self, txn):
+        """ check if the given transaction type is reserved and call the appropriate provisioning function """
+        txn_type = txn["header"]["transaction_type"]
+        status = False
+        # reserved transaction smart contracts
+        rtsc = self.sch.rtsc
+        if txn_type in rtsc:
+            status = self.sch.rtsc[txn_type](txn)
+        elif txn_type in self.sch.tsc:
+            status = self.sch.execute_tsc(txn)
+        return status
 
     def _execute_phase_2(self, config, phase_1_info):
         """
@@ -491,7 +533,7 @@ class ProcessingNode(object):
         phase = verification_record[PHASE]
 
         # get_verifications -- number of phase validations received
-        records = verification_db.get_records(block_id, origin_id, phase)
+        records = verification_db.get_records(block_id=block_id, origin_id=origin_id, phase=phase)
 
         return records
 
@@ -537,6 +579,8 @@ class ProcessingNode(object):
 
             lower_hash = phase_3_record[SIGNATURE][HASH]
 
+            verification_info = lower_hash
+
             # sign verification and rewrite record
             block_info = sign_verification_record(self.network.this_node.node_id,
                                                   prior_block_hash,
@@ -548,7 +592,7 @@ class ProcessingNode(object):
                                                   phase_3_record[ORIGIN_ID],
                                                   int(time.time()),
                                                   phase_3_record['public_transmission'],
-                                                  None
+                                                  verification_info
                                                   )
 
             # inserting verification info after signing
@@ -562,12 +606,108 @@ class ProcessingNode(object):
             if phase_3_record['public_transmission']['p4_pub_trans']:
                 self.network.public_broadcast(block_info, phase)
 
-            self.network.send_block(self.network.phase_4_broadcast, block_info, phase)
             print "phase 4 executed"
 
-    def _execute_phase_5(self, config, phase_5_info):
+    def _execute_phase_5(self, config, verification):
         """ public, Bitcoin bridge phase """
-        print "phase 5 executed"
+        phase = 5
+        verification_record = verification['record']
+
+        verification_info = verification['verification_info']
+        verification_record['verification_info'] = verification_info
+
+        # set block_id and origin_id to None for the reason that the records can come from any phase
+        if validate_verification_record(verification_record, verification_info):
+            timestamp_db.insert_verification(verification_record)
+            verification_db.insert_verification(verification_record)
+            print "phase 5 executed"
+
+    def _execute_timestamping(self, config):
+        """
+        verification_info = {
+                            'verification_records': {
+                                origin_id: {
+                                    'timestamp_id': hash
+                                }
+                            },
+                            'blockchain_type': "BTC"
+                            }
+        """
+        hashes = []
+        verification_info = {
+            'verification_records': {},
+            'blockchain_type': "BTC"
+        }
+        pending_records = timestamp_db.get_pending_timestamp()
+
+        # returns out of the function if there are no records waiting to be broadcast
+        if not pending_records:
+            return
+
+        # creates a list of hashes as well as builds the verification_info structure
+        for r in pending_records:
+            hashes.append(r['signature']['hash'])
+            # organizes the verification records by origin_id with a dictionary of timestamp_ids and hashes
+            if r['origin_id'] not in verification_info['verification_records']:
+                verification_info['verification_records'][r['origin_id']] = {}
+            verification_info['verification_records'][r['origin_id']][r['timestamp_id']] = r['signature']['hash']
+
+        # takes the list of hashes to be transmitted and hashes with 256 bit to get in form to send
+        transaction_hash = final_hash(hashes, type=256)
+
+        # normal SHA512 hash for all lower VR contents
+        lower_hash = final_hash(hashes)
+
+        # sets the hash in the verification_info structure to the hash we just generated
+        verification_info['hash'] = transaction_hash
+
+        stamper = BitcoinTimestamper(self.service_config['bitcoin_network'], BitcoinFeeProvider())
+        bitcoin_tx_id = stamper.persist("%s%s" % (LEVEL5_PREFIX, transaction_hash))
+        bitcoin_tx_id = b2lx(bitcoin_tx_id).encode('utf-8')
+        verification_info['public_transaction_id'] = bitcoin_tx_id
+
+        prior_block_hash = None
+        # This is the hash of all of the lower elements
+        block_id = None
+        phase = 5
+        origin_id = None
+        public_transmission = False
+        block_info = sign_verification_record(self.network.this_node.node_id,
+                                              prior_block_hash,
+                                              lower_hash,
+                                              self.service_config['public_key'],
+                                              self.service_config['private_key'],
+                                              block_id,
+                                              phase,
+                                              origin_id,
+                                              int(time.time()),
+                                              public_transmission,
+                                              verification_info
+                                              )
+
+        # inserts a new verification record for the new record created to be sent
+        verification_db.insert_verification(block_info['verification_record'])
+
+        # sets the timestamp_receipt to true to indicate the records have been sent
+        for origin_id in verification_info['verification_records'].keys():
+            for verification_id in verification_info['verification_records'][origin_id]:
+                timestamp_db.set_transaction_timestamp_proof(verification_id)
+
+        # dictionary where the key is origin_id and the value is list of signatories sent from that origin_id
+        unique_vr_transfers = {}
+
+        # creates a verification_record for each unique origin_id-signatory pair
+        for verification_record in pending_records:
+            if not verification_record['origin_id'] in unique_vr_transfers:
+                unique_vr_transfers[verification_record['origin_id']] = []
+            # inserts a single record per origin_id
+            if verification_record['signature']['signatory'] not in unique_vr_transfers[verification_record['origin_id']]:
+                vr_transfers_db.insert_transfer(verification_record['origin_id'],
+                                                verification_record['signature']['signatory'],
+                                                verification_record['timestamp_id'])
+
+                unique_vr_transfers[verification_record['origin_id']].append(verification_record['signature']['signatory'])
+
 
     @staticmethod
     def split_items(filter_func, items):
@@ -591,6 +731,7 @@ def main():
         parser.add_argument('--debug', default=True, action="store_true")
         parser.add_argument('--private-key', dest="private_key", required=True, help="ECDSA private key for signing")
         parser.add_argument('--public-key', dest="public_key", required=True, help="ECDSA public key for signing")
+        parser.add_argument('--bitcoin-network', dest="bitcoin_network", required=False, help="Bitcoin network (mainnet, testnet, regtest)")
 
         logger().info("Parsing arguments")
         args = vars(parser.parse_args())
@@ -608,6 +749,7 @@ def main():
         host = args["host"]
         port = args["port"]
         phase = args[PHASE]
+        bitcoin_network = args["bitcoin_network"]
 
         ProcessingNode([{
             "type": PHASE,
@@ -617,11 +759,13 @@ def main():
             "public_key": public_key,
             "owner": "DTSS",
             "host": host,
-            "port": port
+            "port": port,
+            "bitcoin_network": bitcoin_network
         }).start()
 
     finally:
         postgres.cleanup()
+
 
 # start calling f now and every 60 sec thereafter
 
